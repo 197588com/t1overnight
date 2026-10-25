@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""Score the triage (排雷) product: does it beat the v2 rank model at the same job?
+
+Metrics are all out-of-sample and all on the identical rows:
+  bl_mean_bp    mean next-day return of the flagged names (more negative = better)
+  bl_hit        share of flagged names that actually rose (lower = better)
+  bl_precision  share of flagged names that landed in the day's realised worst 20%
+  kept_mean_bp  mean next-day return of everything NOT flagged
+  lift_bp       kept_mean - all_mean  (the number that matters for deployment)
+  tail_recall_k share of realised worst-k% names that were flagged
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def daily_pct(p: pd.DataFrame, col: str) -> pd.Series:
+    return p.groupby("date")[col].rank(pct=True, method="first")
+
+
+def metrics(p: pd.DataFrame, bl: pd.Series, tag: str) -> dict:
+    bad = p["y_rank"] <= 0.2
+    f = p["fwd_cc"]
+    kept = ~bl
+    out = {"tag": tag, "n": int(len(p)), "bl_n": int(bl.sum()),
+           "bl_share": float(bl.mean()),
+           "bl_mean_bp": float(f[bl].mean() * 1e4),
+           "bl_hit": float((f[bl] > 0).mean()),
+           "bl_median_bp": float(f[bl].median() * 1e4),
+           "bl_precision": float(bad[bl].mean()),
+           "all_mean_bp": float(f.mean() * 1e4),
+           "kept_mean_bp": float(f[kept].mean() * 1e4),
+           "kept_hit": float((f[kept] > 0).mean()),
+           "lift_bp": float((f[kept].mean() - f.mean()) * 1e4),
+           "tail_recall_5": float(bl[p["y_rank"] <= 0.05].mean()),
+           "tail_recall_2": float(bl[p["y_rank"] <= 0.02].mean())}
+    # per-day dispersion of the lift, for a t-stat
+    per_day = p.assign(bl=bl.to_numpy()).groupby("date").apply(
+        lambda g: g.loc[~g.bl, "fwd_cc"].mean() - g["fwd_cc"].mean(),
+        include_groups=False)
+    out["lift_bp_per_day_t"] = float(per_day.mean() / (per_day.std() / np.sqrt(len(per_day))))
+    out["lift_win_days"] = float((per_day > 0).mean())
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--v3", default="outputs/walkforward_v3")
+    ap.add_argument("--v2", default="outputs/walkforward_v2_lag1/predictions.parquet")
+    ap.add_argument("--out", default="outputs/triage_eval")
+    args = ap.parse_args()
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    rows, frames = [], {}
+
+    # baseline: v2 rank model, blacklist = lowest 20% of score
+    v2 = pd.read_parquet(args.v2)
+    v2["date"] = pd.to_datetime(v2["date"])
+    v2["code"] = v2["code"].astype(str).str.zfill(6)
+    v2["y_rank"] = v2.groupby("date")["fwd_cc"].rank(pct=True)
+    bl = daily_pct(v2, "score") <= 0.2
+    rows.append(metrics(v2, bl, "v2_rank_bottom20"))
+    frames["v2_rank"] = v2.assign(bl=bl.to_numpy())
+
+    for f in sorted(Path(args.v3).glob("pred_*.parquet")):
+        name = f.stem.replace("pred_", "")
+        have = set(pq.ParquetFile(f).schema_arrow.names)
+        cols = [c for c in ("code", "date", "fwd_cc", "score", "bad_prob",
+                            "ret_1", "amount") if c in have]
+        p = pd.read_parquet(f, columns=cols)
+        if "bad_prob" not in p.columns:
+            print(f"(skip {name}: no triage head)")
+            continue
+        p["code"] = p["code"].astype(str).str.zfill(6)
+        p["y_rank"] = p.groupby("date")["fwd_cc"].rank(pct=True)
+        bl = daily_pct(p, "bad_prob") >= 0.8
+        rows.append(metrics(p, bl, name))
+        frames[name] = p.assign(bl=bl.to_numpy())
+        del p
+
+    r = pd.DataFrame(rows).sort_values("lift_bp", ascending=False)
+    extra = None
+    try:
+        extra = pd.read_parquet(ROOT / "outputs/t1_dataset.parquet",
+                                columns=["code", "date", "turn", "amt_ratio", "ret_5"])
+        extra["date"] = pd.to_datetime(extra["date"].astype("datetime64[ns]"))
+        extra = extra.loc[extra["date"] >= pd.Timestamp("2021-12-01")].copy()
+        extra["code"] = extra["code"].astype(str).str.zfill(6)
+    except Exception as e:  # noqa: BLE001
+        print(f"(pool analysis skipped: {e})")
+    pd.set_option("display.width", 240)
+    print("=== triage quality, out-of-sample 2022-01..2026-10 ===")
+    print(r[["tag", "n", "bl_mean_bp", "bl_hit", "bl_precision", "all_mean_bp",
+             "kept_mean_bp", "kept_hit", "lift_bp", "lift_bp_per_day_t",
+             "tail_recall_5", "tail_recall_2"]]
+          .to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+    # cut sensitivity on the best config
+    best = r.iloc[0]["tag"]
+    if best in frames:
+        p = frames[best]
+        print(f"\n=== cut sensitivity ({best}) ===")
+        for cut in [0.10, 0.20, 0.30, 0.40]:
+            bl = daily_pct(p, "bad_prob") >= 1 - cut
+            m = metrics(p, bl, f"top{int(cut*100)}%")
+            print(f"  cut {cut:.0%}: flags {int(bl.sum()):>7,} ({bl.mean():.0%}) "
+                  f"bl_mean={m['bl_mean_bp']:+7.1f}bp kept_mean={m['kept_mean_bp']:+6.2f}bp "
+                  f"lift={m['lift_bp']:+5.2f}bp t={m['lift_bp_per_day_t']:+.2f} "
+                  f"tail_recall5={m['tail_recall_5']:.3f}")
+
+        # year by year
+        print(f"\n=== by year ({best}, cut 20%) ===")
+        p = p.assign(year=p.date.dt.year)
+        for y, g in p.groupby("year"):
+            m = metrics(g, g["bl"], str(y))
+            print(f"  {y}: days={g.date.nunique():>3} bl_mean={m['bl_mean_bp']:+7.1f}bp "
+                  f"kept_mean={m['kept_mean_bp']:+6.2f}bp all={m['all_mean_bp']:+6.2f}bp "
+                  f"lift={m['lift_bp']:+5.2f}bp t={m['lift_bp_per_day_t']:+.2f}")
+
+        # does it protect the names a selection model would actually buy?
+        top = p.sort_values(["date", "bad_prob"]).groupby("date").head(20)
+        print(f"\n=== among the model's own 20 most-wanted names per day ({best}) ===")
+        print(f"  their mean next-day return: {top.fwd_cc.mean()*1e4:+.1f}bp "
+              f"(universe {p.fwd_cc.mean()*1e4:+.1f}bp)")
+
+    # --- does the veto help on the names a real strategy would consider? ---
+    if extra is not None and best in frames:
+        p = frames[best].merge(extra, on=["code", "date"], how="left")
+        print(f"\n=== veto value inside candidate pools ({best}) ===")
+        print("  a pool = the names a momentum/money-flow screen would surface today")
+        pool_rows = []
+        for label, col, asc in [("换手率前10%", "turn", False), ("成交额前10%", "amount", False),
+                                ("当日涨幅前10%", "ret_1", False), ("5日涨幅前10%", "ret_5", False),
+                                ("模型最看好10%", "bad_prob", True)]:
+            if col not in p.columns or p[col].isna().all():
+                continue
+            q = p.groupby("date")[col].transform(lambda s: s.rank(pct=True, ascending=asc))
+            pool = p[q >= 0.9]
+            if len(pool) < 5000:
+                continue
+            f = pool["bl"]
+            pool_rows.append({"pool": label, "n": len(pool),
+                              "all_bp": pool.fwd_cc.mean() * 1e4,
+                              "bl_bp": pool.loc[f, "fwd_cc"].mean() * 1e4,
+                              "kept_bp": pool.loc[~f, "fwd_cc"].mean() * 1e4,
+                              "flag_rate": float(f.mean()),
+                              "gain_bp": (pool.loc[~f, "fwd_cc"].mean()
+                                          - pool["fwd_cc"].mean()) * 1e4})
+        pr = pd.DataFrame(pool_rows)
+        if not pr.empty:
+            pr["gain_yuan_per_100k"] = pr["gain_bp"] / 1e4 * 100_000
+            print(pr.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+            pr.to_csv(out / "pool_value.csv", index=False)
+
+    r.to_csv(out / "triage_quality.csv", index=False)
+    json.dump(r.to_dict(orient="records"), open(out / "triage_quality.json", "w"), indent=1)
+    print(f"\n[done] -> {out}")
+
+
+if __name__ == "__main__":
+    main()

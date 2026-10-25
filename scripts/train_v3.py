@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+"""v3 walk-forward: isolate the effect of (a) the objective and (b) each feature block.
+
+Configs (all strict point-in-time, features lagged 1 bar within code):
+    rank      v2 features, rank-regression head      == the v2 model, reproduced here
+    tri_base  v2 features, triage head (bottom-20% binary)
+    tri_A     + microstructure shape block
+    tri_B     + industry relative strength
+    tri_C     + market regime
+
+Every config sees the identical folds and the identical rows, so differences are
+attributable to the change under test.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+
+BASE = [
+    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "ret_60",
+    "gap", "intraday", "close_pos", "amp",
+    "vol_5", "vol_20", "vol_ratio",
+    "ma_dev_5", "ma_dev_20", "ma_dev_60", "dist_high_20", "dist_low_20", "dist_high_5",
+    "log_amt", "amt_ratio", "amt_trend", "turn", "turn_ratio", "log_mktcap",
+    "lu_cnt_5", "lu_cnt_20", "z_ret", "streak_up", "days_listed",
+    "roe", "net_profit_yoy", "revenue_yoy",
+    "cs_ret_1", "cs_ret_5", "cs_amt", "cs_turn", "cs_ma_dev_20",
+    "board",
+]
+SHAPE = ["vwap_dev", "upper_shadow", "lower_shadow", "body",
+         "dd_20", "close_pos_5", "down_vol_ratio", "turn_z", "ret_accel"]
+IND = ["ind_ret_1", "ind_ret_5", "ind_ret_20", "ind_rel_5", "ind_rel_20",
+       "ind_rank_5", "ind_strength"]
+MKT = ["lu_ratio", "ld_ratio", "mkt_ret_5", "mkt_ret_20", "mkt_vol_20",
+       "mkt_disp", "mkt_nh_ratio", "mkt_close_pos", "mkt_amt_z"]
+
+CONFIGS = {
+    "rank":     dict(feats=BASE, head="rank"),
+    "tri_base": dict(feats=BASE, head="triage"),
+    "tri_A":    dict(feats=BASE + SHAPE, head="triage"),
+    "tri_B":    dict(feats=BASE + SHAPE + IND, head="triage"),
+    "tri_C":    dict(feats=BASE + SHAPE + IND + MKT, head="triage"),
+}
+
+PARAMS = dict(learning_rate=0.03, num_leaves=31, min_child_samples=600,
+              feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
+              lambda_l2=5.0, n_estimators=300, n_jobs=10, verbose=-1)
+
+
+def make_folds(first_test: str, last_date: str, valid_months: int = 3) -> list[dict]:
+    folds, cur, last = [], pd.Timestamp(first_test), pd.Timestamp(last_date)
+    while cur <= last:
+        te_end = min(cur + pd.DateOffset(months=3) - pd.Timedelta(days=1), last)
+        v_end = cur - pd.Timedelta(days=1)
+        v_start = v_end - pd.DateOffset(months=valid_months) + pd.Timedelta(days=1)
+        folds.append({"train_end": (v_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                      "valid_end": v_end.strftime("%Y-%m-%d"),
+                      "test_start": cur.strftime("%Y-%m-%d"),
+                      "test_end": te_end.strftime("%Y-%m-%d")})
+        cur = (cur + pd.DateOffset(months=3)).replace(day=1)
+    return folds
+
+
+def load(args) -> pd.DataFrame:
+    need = ["code", "date"] + BASE + ["close", "open", "volume", "amount", "band",
+                                      "st_proxy", "exec_ok", "ret_20", "fwd_cc"]
+    seen, need_u = set(), []
+    for c in need:
+        if c not in seen:
+            seen.add(c); need_u.append(c)
+    df = pd.read_parquet(args.dataset, columns=need_u)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["fwd_cc"].notna() & (df["exec_ok"] == 1)]
+    amt = df["amount"].where(df["amount"].notna(), df["close"] * df["volume"])
+    m = (df["close"].between(2.0, 300.0) & (amt >= 20_000_000.0) & (df["volume"] > 0)
+         & (df["st_proxy"].fillna(0) < 0.5) & (df["ret_1"] < (df["band"] - 0.005))
+         & df["ret_20"].notna())
+    df = df[m.fillna(False)].reset_index(drop=True)
+    print(f"[universe] actionable rows={len(df):,}", flush=True)
+
+    ex = pd.read_parquet(args.extra, columns=["code", "date", "ind_code"] + SHAPE + IND + MKT)
+    ex["date"] = pd.to_datetime(ex["date"])
+    df = df.merge(ex, on=["code", "date"], how="left")
+    df["ind_code"] = df["ind_code"].fillna(-1).astype("int16")
+
+    # strict point-in-time: every feature shifted one bar back within code
+    df = df.sort_values(["code", "date"], kind="mergesort")
+    cols = BASE + SHAPE + IND + MKT
+    for c in cols:
+        df[c] = df.groupby("code", sort=False)[c].shift(1).astype(np.float32)
+    df["ind_code"] = (df.groupby("code", sort=False)["ind_code"].shift(1)
+                      .fillna(-1).astype("int16"))
+    df["board"] = df["board"].fillna(-1).astype("int16")
+    df = df.sort_values(["date", "code"], kind="mergesort").reset_index(drop=True)
+
+    df["y_rank"] = df.groupby("date")["fwd_cc"].rank(pct=True).astype(np.float32)
+    df["y_bad"] = (df["y_rank"] <= 0.2).astype(np.int8)
+    print(f"[data] {len(df):,} rows, {df.date.nunique()} dates, "
+          f"{df.date.min().date()} -> {df.date.max().date()}", flush=True)
+    return df
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
+    ap.add_argument("--extra", default="outputs/t1_extra_v3.parquet")
+    ap.add_argument("--out-dir", default="outputs/walkforward_v3")
+    ap.add_argument("--first-test", default="2022-01-01")
+    ap.add_argument("--rounds", type=int, default=300)
+    ap.add_argument("--configs", default=",".join(CONFIGS))
+    args = ap.parse_args()
+
+    out = Path(args.out_dir)
+    (out / "models").mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    df = load(args)
+    names = [c for c in args.configs.split(",") if c]
+    folds = make_folds(args.first_test, str(df.date.max().date()))
+    dates = df["date"].values
+    print(f"[plan] {len(folds)} folds x {len(names)} configs", flush=True)
+
+    frames: dict[str, list[pd.DataFrame]] = {n: [] for n in names}
+    detail = []
+
+    for i, f in enumerate(folds, 1):
+        tf = time.time()
+        tr_mask = dates <= np.datetime64(f["train_end"])
+        te_mask = ((dates > np.datetime64(f["valid_end"]))
+                   & (dates <= np.datetime64(f["test_end"])))
+        if tr_mask.sum() == 0 or te_mask.sum() == 0:
+            continue
+        tr, te = df[tr_mask], df[te_mask]
+        tag = pd.Timestamp(f["test_start"]).strftime("%Y%m")
+
+        for name in names:
+            cfg = CONFIGS[name]
+            use_ind = any(c.startswith("ind_") for c in cfg["feats"])
+            cols = cfg["feats"] + (["ind_code"] if use_ind else [])
+            cat = [c for c in ("board", "ind_code") if c in cols]
+            if cfg["head"] == "rank":
+                mdl = lgb.LGBMRegressor(objective="regression_l2",
+                                        **dict(PARAMS, n_estimators=args.rounds))
+                mdl.fit(tr[cols], tr["y_rank"], categorical_feature=cat)
+                pred = mdl.predict(te[cols])
+                head_col = "score"
+            else:
+                mdl = lgb.LGBMClassifier(objective="binary",
+                                         **dict(PARAMS, n_estimators=args.rounds))
+                mdl.fit(tr[cols], tr["y_bad"], categorical_feature=cat)
+                pred = mdl.predict_proba(te[cols])[:, 1]
+                head_col = "bad_prob"
+            mdl.booster_.save_model(str(out / "models" / f"{name}_{tag}.txt"))
+
+            part = te[["code", "date", "close", "fwd_cc", "ret_1", "amount", "band",
+                       "st_proxy", "board", "y_rank"]].copy()
+            part[head_col] = pred.astype(np.float32)
+            part["config"] = name
+            frames[name].append(part)
+
+            detail.append({"fold": tag, "config": name, "train_rows": int(tr_mask.sum()),
+                           "test_rows": int(te_mask.sum())})
+        print(f"  fold {i:02d} {f['test_start']}..{f['test_end']} "
+              f"train={int(tr_mask.sum()):>8,} test={int(te_mask.sum()):>7,} "
+              f"{time.time()-tf:.0f}s", flush=True)
+
+    for name in names:
+        if not frames[name]:
+            continue
+        p = pd.concat(frames[name], ignore_index=True)
+        p.to_parquet(out / f"pred_{name}.parquet", index=False, compression="zstd")
+        col = "bad_prob" if CONFIGS[name]["head"] == "triage" else "score"
+        ic = (p.groupby("date").apply(
+            lambda g: g[col].corr(g["fwd_cc"], method="spearman"), include_groups=False)
+            .dropna())
+        # triage quality: top-20% of bad_prob (or bottom-20% of score) as blacklist
+        pct = p.groupby("date")[col].rank(pct=True)
+        p["bl"] = (pct <= 0.2) if col == "score" else (pct >= 0.8)
+        kept = p[~p["bl"]]
+        print(f"[{name}] IC={ic.mean():+.4f} | blacklist n={p.bl.sum():,} "
+              f"mean={p.loc[p.bl,'fwd_cc'].mean()*1e4:+.1f}bp hit={(p.loc[p.bl,'fwd_cc']>0).mean():.3f}"
+              f" | kept mean={kept.fwd_cc.mean()*1e4:+.1f}bp hit={(kept.fwd_cc>0).mean():.3f}",
+              flush=True)
+        json.dump({"config": name, "ic": float(ic.mean()),
+                   "icir": float(ic.mean() / ic.std() * np.sqrt(244))},
+                  open(out / f"meta_{name}.json", "w"), indent=1)
+
+    pd.DataFrame(detail).to_csv(out / "fold_rows.csv", index=False)
+    print(f"\n[done] {time.time()-t0:.0f}s -> {out}")
+
+
+if __name__ == "__main__":
+    main()

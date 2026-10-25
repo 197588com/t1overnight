@@ -1,0 +1,29 @@
+# macOS / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# 密钥（绝不入库）
+.env
+*.env
+secrets.*
+*.pem
+*.key
+
+# 日志
+*.log
+
+# 十年行情数据池与回测产出（3.7G），按 README 重建
+outputs/
+data/
