@@ -117,8 +117,10 @@ def annotate(df: pd.DataFrame, iv: pd.DataFrame | None = None,
     m = pd.merge_asof(left, right, on="date", by="code", direction="backward")
     hit = m["end"].notna().to_numpy() & (m["date"].to_numpy() <= m["end"].to_numpy())
 
-    out["is_st"] = np.where(hit, m["is_st"].fillna(False).to_numpy(), False)
-    out["is_delist"] = np.where(hit, m["is_delist"].fillna(False).to_numpy(), False)
+    # cast hard to bool: merge_asof back-fills unmatched rows with NaN, which
+    # silently turns the column into object dtype and breaks boolean indexing
+    out["is_st"] = hit & m["is_st"].fillna(False).to_numpy(dtype=bool, na_value=False)
+    out["is_delist"] = hit & m["is_delist"].fillna(False).to_numpy(dtype=bool, na_value=False)
     if with_name:
         out["name_pit"] = m["name"].where(hit).to_numpy()
     return out

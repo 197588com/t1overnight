@@ -115,7 +115,8 @@ def main() -> None:
     runs = [tuple(r.split(":")) for r in args.runs.split(",") if r]
     folds = make_folds(args.first_test, str(df.date.max().date()))
     dates = df["date"].values
-    st_flag = df["is_st"].to_numpy() | df["is_delist"].to_numpy()
+    st_flag = (df["is_st"].to_numpy(dtype=bool)
+               | df["is_delist"].to_numpy(dtype=bool))
     print(f"[plan] {len(folds)} folds x {len(runs)} runs | "
           f"universe keep={len(df):,} drop={int((~st_flag).sum()):,}", flush=True)
 

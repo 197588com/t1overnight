@@ -38,17 +38,19 @@ COST_RT = 0.0020       # round-trip cost assumed in the ledger's net column
 BOARD = {0: "沪主板", 1: "深主板", 2: "创业板", 3: "科创板", 4: "北交所"}
 
 
-def newest_model(model_dir: Path) -> Path:
-    ms = sorted(model_dir.glob("rank_*.txt"))
+def newest_model(model_dir: Path, pattern: str) -> Path:
+    ms = sorted(model_dir.glob(pattern))
     if not ms:
-        raise FileNotFoundError(f"no rank_*.txt under {model_dir}")
+        raise FileNotFoundError(f"no {pattern} under {model_dir}")
     return ms[-1]
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
-    ap.add_argument("--models", default="outputs/walkforward_v2_lag1/models")
+    # v4: ST rows removed from training and from the prediction universe
+    ap.add_argument("--models", default="outputs/walkforward_v4/models")
+    ap.add_argument("--pattern", default="drop_rank_*.txt")
     ap.add_argument("--universe",
                     default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/universe.parquet")
     ap.add_argument("--out-dir", default="outputs/live")
@@ -68,7 +70,7 @@ def main() -> None:
     if snap.empty:
         raise SystemExit(f"no rows on {asof.date()}")
 
-    model = newest_model(Path(args.models))
+    model = newest_model(Path(args.models), args.pattern)
     booster = lgb.Booster(model_file=str(model))
     print(f"[model] {model.name}")
     print(f"[signal bar] {asof.date()}  rows {len(snap):,}")

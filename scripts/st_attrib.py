@@ -39,7 +39,7 @@ BASE = ["ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "ret_60",
 
 def universe(path: Path) -> pd.DataFrame:
     need = ["code", "date", "close", "volume", "amount", "band", "st_proxy",
-            "exec_ok", "ret_20", "fwd_cc"] + DIAG
+            "exec_ok", "ret_20", "ret_1", "fwd_cc"] + DIAG
     need = list(dict.fromkeys(need))
     df = pd.read_parquet(path, columns=need)
     df["date"] = pd.to_datetime(df["date"])
