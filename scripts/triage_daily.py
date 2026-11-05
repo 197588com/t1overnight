@@ -16,6 +16,7 @@ Usage
 """
 from __future__ import annotations
 
+import os
 import argparse
 import glob
 import sys
@@ -76,7 +77,9 @@ def main() -> None:
     ap.add_argument("--extra", default=str(ROOT / "outputs/t1_extra_v3.parquet"))
     ap.add_argument("--model-dir", default=str(ROOT / "outputs/walkforward_v3/models"))
     ap.add_argument("--config", default="tri_B")
-    ap.add_argument("--names", default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/universe.parquet")
+    ap.add_argument("--names",
+                    default=os.environ.get("T1_UNIVERSE",
+                                           os.path.expanduser("~/datapool/parquet/universe.parquet")))
     ap.add_argument("--asof", default=None)
     ap.add_argument("--cut", type=float, default=CUT)
     ap.add_argument("--check", nargs="*", default=None, help="inspect specific codes")

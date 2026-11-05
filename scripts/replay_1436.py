@@ -6,6 +6,7 @@ Only the pool that could plausibly occupy the top of the ranking is pulled
 """
 from __future__ import annotations
 
+import os
 import argparse
 import time
 from pathlib import Path
@@ -88,7 +89,8 @@ def main() -> None:
     print(f"[tape] {len(intr)} names with minute data", flush=True)
 
     # ---- rebuild truncated features ---------------------------------------
-    daily = pd.read_parquet("/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/daily_k.parquet",
+    daily = pd.read_parquet(os.environ.get(
+        "T1_DATAPOOL", os.path.expanduser("~/datapool/parquet")) + "/daily_k.parquet",
                             columns=["code", "date", "open", "high", "low", "close",
                                      "volume", "amount", "outstanding_share", "turnover"])
     daily["code"] = daily["code"].astype(str).str.zfill(6)

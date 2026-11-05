@@ -10,6 +10,7 @@ comparison is exact rather than approximately exact.
 """
 from __future__ import annotations
 
+import os
 import argparse
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ from t1overnight import live  # noqa: E402
 from t1overnight.features import FEATURES  # noqa: E402
 from t1overnight.features_v3 import IND, MKT, SHAPE  # noqa: E402
 
-SRC = "/Users/yanglin/Desktop/未命名文件夹/datapool/parquet"
+SRC = os.environ.get("T1_DATAPOOL", os.path.expanduser("~/datapool/parquet"))
 
 
 def main() -> None:

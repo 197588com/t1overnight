@@ -26,6 +26,12 @@ def main() -> None:
     ap.add_argument("--source", required=True, help="parquet directory of the datapool")
     ap.add_argument("--out", default="outputs/t1_dataset.parquet")
     ap.add_argument("--start", default="2016-01-01")
+    ap.add_argument("--append-dir", default="outputs/append",
+                    help="tushare daily snapshots spliced in for bars the datapool "
+                         "does not have yet; on overlap the datapool wins, because it "
+                         "is the series every backtest was calibrated on")
+    ap.add_argument("--prefer-append", action="store_true",
+                    help="let the tushare snapshot win on overlap (diagnostics only)")
     args = ap.parse_args()
 
     src = Path(args.source)
@@ -36,6 +42,26 @@ def main() -> None:
     daily["code"] = daily["code"].astype(str).str.zfill(6)
     daily["date"] = pd.to_datetime(daily["date"])
     daily = daily[daily["date"] >= pd.Timestamp(args.start)]
+
+    # splice in tushare snapshots for bars the datapool has not received yet
+    ap_dir = Path(args.append_dir)
+    if ap_dir.exists():
+        parts = []
+        for f in sorted(ap_dir.glob("*.parquet")):
+            if ".incomplete" in f.name:
+                continue
+            parts.append(pd.read_parquet(f))
+        if parts:
+            add = pd.concat(parts, ignore_index=True)
+            add = add[add["date"] >= pd.Timestamp(args.start)]
+            add["code"] = add["code"].astype(str).str.zfill(6)
+            add["date"] = pd.to_datetime(add["date"])
+            before = len(daily)
+            daily = pd.concat([daily, add[list(KEEP_COLS)]], ignore_index=True)
+            keep = "last" if args.prefer_append else "first"
+            daily = daily.drop_duplicates(["code", "date"], keep=keep)
+            print(f"[append] {len(parts)} snapshot(s) {add['date'].min().date()}..{add['date'].max().date()}"
+                  f" | +{len(daily)-before:,} rows the datapool was missing", flush=True)
 
     t1 = time.time()
     df = compute_base(daily)

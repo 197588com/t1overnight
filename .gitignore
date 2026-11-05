@@ -27,3 +27,16 @@ secrets.*
 # 十年行情数据池与回测产出（3.7G），按 README 重建
 outputs/
 data/
+
+# 本机工作区记忆（含账号目录、推送目标 ID 等运行环境细节）
+.workbuddy/
+
+# 部署实例产物：plist 由 render_launchd.sh 从 config.env 渲染，内含本机绝对路径
+deploy/launchd/*.plist
+deploy/archive/
+
+# 退役脚本归档（历史留档，不进公开仓库）
+scripts/_retired_*/
+
+# 手工备份
+*.bak

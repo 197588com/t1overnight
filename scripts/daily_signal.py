@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
 """Daily trade signal under the production rule (open-to-open, T+1 legal).
 
-Rule baked in here so it cannot be misapplied:
+One naming convention for the whole project -- S is the signal bar:
 
-    signal frame   D-1 close (features lagged 1 bar, model already trained that way)
-    entry          D 09:30 opening auction
-    skip today     if the opening gap (open / prev_close - 1) exceeds GAP_MAX
-    exit           D+1 09:30 opening auction
+    signal bar     S close (features lagged 1 bar, model already trained that way)
+    entry          S+1 09:30 opening auction
+    skip           if the opening gap (open / prev_close - 1) exceeds GAP_MAX
+    exit           S+2 09:30 opening auction
 
-Why open-to-open: with the strict lag-1 model the score on row (code, D-1) is knowable
-before D's opening auction. Waiting until D's close gives up the whole D intraday leg
+``daily_signal.py``, ``settle_ledger.py`` and the ledger columns use exactly this
+S/S+1/S+2 frame (``signal_bar`` / ``trade_date`` / ``exit_date``).  Earlier the
+docstring here called the entry day "D", which read as one day earlier than the
+same letter in settle_ledger and produced a void row bought on the wrong basis.
+
+S+1 and S+2 come from the exchange calendar.  Weekday arithmetic (``BDay``) is
+wrong twice a year: a signal on the last session before a holiday would name a
+holiday as the buy day, and settle_ledger -- which only grades rows whose
+trade_date exists in the dataset -- would then never grade that trade.
+
+Why open-to-open: with the strict lag-1 model the score on row (code, S) is knowable
+before S+1's opening auction. Waiting until S+1's close gives up the whole intraday leg
 (+40.8bp in backtest) and keeps only the overnight leg (-18.5bp).
 
 Usage:
@@ -20,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,8 +44,14 @@ sys.path.insert(0, str(ROOT))
 from scripts.train_v2 import FEATURES  # noqa: E402
 from t1overnight.backtest import SelectConfig, tradable  # noqa: E402
 
-GAP_MAX = 0.015        # skip the day if the open gaps up more than this
-COST_RT = 0.0020       # round-trip cost assumed in the ledger's net column
+# Opening-gap cap.  Sourced from deploy/config.env (T1_GAP_MAX) so the number that
+# gates the entry has one home; the literal here is only the fallback for a bare
+# `python scripts/daily_signal.py` run.  Values must not drift between the two.
+GAP_MAX = float(os.environ.get("T1_GAP_MAX", "0.015"))
+# Cost is applied once, in scripts/settle_ledger.py (COST_ROUND_TRIP = 13bp).
+# A second constant used to live here claiming 20bp "in the ledger's net column",
+# which was simply false and would have made two files disagree about the same
+# number.  Do not reintroduce one.
 BOARD = {0: "沪主板", 1: "深主板", 2: "创业板", 3: "科创板", 4: "北交所"}
 
 
@@ -52,11 +69,21 @@ def main() -> None:
     ap.add_argument("--models", default="outputs/walkforward_v4/models")
     ap.add_argument("--pattern", default="drop_rank_*.txt")
     ap.add_argument("--universe",
-                    default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/universe.parquet")
+                    default=os.environ.get("T1_UNIVERSE",
+                                       os.path.expanduser("~/datapool/parquet/universe.parquet")))
     ap.add_argument("--out-dir", default="outputs/live")
     ap.add_argument("--asof", default=None, help="signal bar date; default = newest in dataset")
     ap.add_argument("--top", type=int, default=5)
+    # default = the account's real permissions: main boards (no qualification)
+    # + ChiNext (100k + 24m).  STAR board (688) needs 500k + 24m and is excluded.
+    ap.add_argument("--boards", default="0,1,2",
+                    help="permitted boards: 0 沪主板 1 深主板 2 创业板 3 科创板 4 北交所. "
+                         "Main boards need no account qualification; ChiNext needs 100k+24m; "
+                         "STAR needs 500k+24m.")
+    ap.add_argument("--tier", default="", help="label written into the forward ledger")
     args = ap.parse_args()
+
+    allowed = tuple(int(b) for b in str(args.boards).split(",") if str(b).strip() != "")
 
     db = Path(args.dataset)
     df = pd.read_parquet(db, columns=["code", "date"] + FEATURES +
@@ -77,14 +104,21 @@ def main() -> None:
 
     snap["score"] = booster.predict(snap[FEATURES])
 
-    # prev close, for the opening-gap filter
-    prev = (df.loc[df["date"] < asof, ["code", "date", "close"]]
-            .sort_values(["code", "date"]).groupby("code").tail(1)
-            .rename(columns={"close": "prev_close"})[["code", "prev_close"]])
-    snap = snap.merge(prev, on="code", how="left")
+    # Opening-gap benchmark.  The model is predicting open(D)/open(D-1) with
+    # D = the bar *after* asof, and the features of row asof are already lag-1,
+    # so asof IS D-1: the reference price must be close(asof), i.e. snap["close"].
+    # Using close(asof-1) shifts the filter a full day -- for a name that moved
+    # 4% on the signal bar the cap lands *below* the signal close and the day is
+    # always skipped.
+    snap["prev_close"] = snap["close"]
 
     cfg = SelectConfig(top_n=1)
     snap = snap[tradable(snap, cfg)].copy()
+    n_all = len(snap)
+    snap = snap[snap["board"].isin(allowed)].copy()
+    if snap.empty:
+        raise SystemExit(f"no tradable name on boards {allowed}")
+    print(f"[boards] 允许 {allowed} → 池子 {n_all:,} → {len(snap):,}")
     snap["pct"] = snap["score"].rank(pct=True)
 
     names = pd.read_parquet(args.universe, columns=["code", "name"])
@@ -115,21 +149,39 @@ def main() -> None:
     bl[cols].to_csv(out / "blacklist_latest.csv", index=False, encoding="utf-8-sig")
 
     top = snap.nlargest(args.top, "score")[cols].copy()
-    top["建议"] = "D 日 09:30 开盘买入"
+    top["建议"] = "次日 09:30 开盘买入"
     if len(top):
         top.iloc[0, top.columns.get_loc("建议")] = "首选（若开盘涨幅 ≤ 1.5%）"
 
-    # next trading day: use the dataset's own calendar; fall back to weekdays for
-    # dates beyond the data (holidays must be checked manually).
+    # S+1 / S+2 must come from the exchange calendar, not from weekday arithmetic
+    # (see the module docstring).  The dataset can only answer this when replaying
+    # a past bar with later sessions already loaded, so it is the fallback.
     known = np.sort(df["date"].unique())
-    later = known[known > np.datetime64(asof)]
-    if len(later):
-        nxt = pd.Timestamp(later[0])
-        cal_note = "按本地交易日历"
-    else:
-        nxt = asof + pd.offsets.BDay(1)
-        cal_note = "本地数据未覆盖，按工作日推算（需核对节假日）"
-    exit_d = nxt + pd.offsets.BDay(1)
+    nxt = exit_d = None
+    cal_note = ""
+    try:
+        from fetch_today import next_trade_day          # noqa: E402
+        a = next_trade_day(asof.strftime("%Y%m%d"), 1)
+        b = next_trade_day(asof.strftime("%Y%m%d"), 2)
+        if a:
+            nxt = pd.Timestamp(a)
+            cal_note = "交易所日历"
+        if b:
+            exit_d = pd.Timestamp(b)
+    except Exception as exc:                            # noqa: BLE001
+        print(f"[cal] 日历查询失败（{type(exc).__name__}），退回本地推算：{exc}")
+
+    if nxt is None:
+        later = known[known > np.datetime64(asof)]
+        if len(later):
+            nxt = pd.Timestamp(later[0])
+            cal_note = "按本地交易日历"
+        else:
+            nxt = asof + pd.offsets.BDay(1)
+            cal_note = "本地数据未覆盖，按工作日推算（遇节假日会错，需人工核对）"
+    if exit_d is None:
+        after = known[known > np.datetime64(nxt)]
+        exit_d = pd.Timestamp(after[0]) if len(after) else nxt + pd.offsets.BDay(1)
     print(f"\n{'='*78}")
     print(f"交易信号：{asof.date()} 收盘后生成 → {nxt.date()} 开盘执行")
     print(f"{'='*78}")
@@ -148,10 +200,12 @@ def main() -> None:
         print(f"  开盘涨幅 ≤ {GAP_MAX:.1%} → 昨收 × {1+GAP_MAX:.3f} = {b['prev_close']*(1+GAP_MAX):.2f} 以下才买")
         print(f"  若开盘价高于该价位，放弃，次日重新出信号")
 
-    # forward ledger: one row per signal, filled in after execution
+    # forward ledger: one row per (signal bar, permission tier), filled after execution
     ledger = out / "forward_ledger.csv"
+    tier = args.tier or ",".join(map(str, allowed))
     row = pd.DataFrame([{
         "signal_bar": asof.date().isoformat(),
+        "tier": tier,
         "trade_date": nxt.date().isoformat(),
         "code": top.iloc[0]["code"] if len(top) else "",
         "name": top.iloc[0]["name"] if len(top) else "",
@@ -160,13 +214,19 @@ def main() -> None:
         "prev_close": float(top.iloc[0]["prev_close"]) if len(top) else np.nan,
         "gap_cap": round(float(top.iloc[0]["prev_close"]) * (1 + GAP_MAX), 2) if len(top) else np.nan,
         "entry_price": np.nan, "exit_date": "", "exit_price": np.nan,
-        "gross_ret": np.nan, "net_ret": np.nan, "traded": "",
+        "gross_ret": np.nan, "net_ret": np.nan,
+        # an empty pick is a fact worth recording: without a marker it looks like
+        # a trade that simply has not opened yet, and every count downstream
+        # (settle / status board) treats it as pending forever
+        "traded": "" if len(top) else "no_pick",
         "logged_at": datetime.now().isoformat(timespec="seconds"),
     }])
     if ledger.exists():
         old = pd.read_csv(ledger, dtype={"code": str})
-        old = old[old["signal_bar"] != asof.date().isoformat()]
-        row = pd.concat([old, row], ignore_index=True)
+        if "tier" not in old.columns:
+            old["tier"] = "全市场"
+        stay = ~((old["signal_bar"] == asof.date().isoformat()) & (old["tier"] == tier))
+        row = pd.concat([old[stay], row], ignore_index=True)
     row.to_csv(ledger, index=False, encoding="utf-8-sig")
     print(f"\n[ledger] {ledger}  ({len(row)} signals recorded)")
 

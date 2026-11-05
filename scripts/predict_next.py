@@ -6,6 +6,7 @@ bars up to D-1, so scoring the newest bar gives a ranking usable at the open of 
 """
 from __future__ import annotations
 
+import os
 import argparse
 import sys
 from pathlib import Path
@@ -24,7 +25,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
     ap.add_argument("--models", default="outputs/walkforward_v2_lag1/models")
-    ap.add_argument("--universe", default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/universe.parquet")
+    ap.add_argument("--universe",
+                    default=os.environ.get("T1_UNIVERSE", os.path.expanduser("~/datapool/parquet") + "/universe.parquet"))
     ap.add_argument("--out-dir", default="outputs/live")
     args = ap.parse_args()
 

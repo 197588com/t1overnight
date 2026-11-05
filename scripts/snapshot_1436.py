@@ -17,6 +17,7 @@ Usage
 """
 from __future__ import annotations
 
+import os
 import argparse
 import glob
 import sys
@@ -32,7 +33,7 @@ sys.path.insert(0, str(ROOT))
 
 from t1overnight import live  # noqa: E402
 
-SRC = Path("/Users/yanglin/Desktop/未命名文件夹/datapool/parquet")
+SRC = Path(os.environ.get("T1_DATAPOOL", os.path.expanduser("~/datapool/parquet")))
 
 
 def newest(model_dir: str, config: str) -> Path:

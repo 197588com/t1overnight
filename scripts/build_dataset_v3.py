@@ -6,6 +6,7 @@ Keeping it separate keeps peak RAM low and lets training pick feature groups.
 """
 from __future__ import annotations
 
+import os
 import argparse
 import sys
 import time
@@ -27,7 +28,8 @@ DT = {"code": "string", "open": "float32", "high": "float32", "low": "float32",
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
-    ap.add_argument("--fin", default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/fin_quarterly.parquet")
+    ap.add_argument("--fin",
+                    default=os.environ.get("T1_DATAPOOL", os.path.expanduser("~/datapool/parquet")) + "/fin_quarterly.parquet")
     ap.add_argument("--out", default="outputs/t1_extra_v3.parquet")
     args = ap.parse_args()
 

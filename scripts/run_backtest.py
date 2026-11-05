@@ -2,6 +2,7 @@
 """Backtest the T+1 overnight model predictions."""
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import sys
@@ -44,7 +45,8 @@ def main() -> None:
     ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
     ap.add_argument("--out-dir", default="outputs/backtest")
     ap.add_argument("--capital", type=float, default=100_000.0)
-    ap.add_argument("--universe", default="/Users/yanglin/Desktop/未命名文件夹/datapool/parquet/universe.parquet")
+    ap.add_argument("--universe",
+                    default=os.environ.get("T1_UNIVERSE", os.path.expanduser("~/datapool/parquet") + "/universe.parquet"))
     args = ap.parse_args()
 
     out = Path(args.out_dir)
