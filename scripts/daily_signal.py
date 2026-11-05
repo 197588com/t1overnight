@@ -66,7 +66,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="outputs/t1_dataset.parquet")
     # v4: ST rows removed from training and from the prediction universe
-    ap.add_argument("--models", default="outputs/walkforward_v4/models")
+    ap.add_argument("--models",
+                    default=os.environ.get("T1_MODELS", "outputs/walkforward_v4/models"))
     ap.add_argument("--pattern", default="drop_rank_*.txt")
     ap.add_argument("--universe",
                     default=os.environ.get("T1_UNIVERSE",
